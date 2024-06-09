@@ -35,9 +35,11 @@ class GitProgress(RemoteProgress):
         self.pbar.refresh()
 
 
-def gitclone(custom_nodes_path, url, target_hash=None):
+def gitclone(custom_nodes_path, url, target_hash=None, repo_path=None):
     repo_name = os.path.splitext(os.path.basename(url))[0]
-    repo_path = os.path.join(custom_nodes_path, repo_name)
+
+    if repo_path is None:
+        repo_path = os.path.join(custom_nodes_path, repo_name)
 
     # Clone the repository from the remote URL
     repo = git.Repo.clone_from(url, repo_path, recursive=True, progress=GitProgress())
@@ -234,7 +236,7 @@ def checkout_custom_node_hash(git_custom_node_infos):
             path = os.path.join(working_directory, repo_name)
             if not os.path.exists(path):
                 print(f"CLONE: {path}")
-                gitclone(working_directory, k, v['hash'])
+                gitclone(working_directory, k, target_hash=v['hash'])
 
 
 def invalidate_custom_node_file(file_custom_node_infos):
@@ -401,7 +403,11 @@ setup_environment()
 
 try:
     if sys.argv[1] == "--clone":
-        gitclone(sys.argv[2], sys.argv[3])
+        repo_path = None
+        if len(sys.argv) > 4:
+            repo_path = sys.argv[4]
+
+        gitclone(sys.argv[2], sys.argv[3], repo_path=repo_path)
     elif sys.argv[1] == "--check":
         gitcheck(sys.argv[2], False)
     elif sys.argv[1] == "--fetch":

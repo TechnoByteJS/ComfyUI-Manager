@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import subprocess
@@ -10,17 +11,20 @@ import git
 from git.remote import RemoteProgress
 from urllib.parse import urlparse
 from tqdm.auto import tqdm
-import aiohttp
-import threading
-import json
 import time
 import yaml
 import zipfile
+import asyncio
+from rich import print
+from packaging import version
+from torchvision.datasets.utils import download_url
+import uuid
 
 glob_path = os.path.join(os.path.dirname(__file__))  # ComfyUI-Manager/glob
 sys.path.append(glob_path)
 
 import cm_global
+import cnr_utils
 from manager_util import *
 
 version = [2, 37, 1]
@@ -42,10 +46,6 @@ comfy_ui_required_commit_datetime = datetime(2024, 1, 24, 0, 0, 0)
 
 comfy_ui_revision = "Unknown"
 comfy_ui_commit_datetime = datetime(1900, 1, 1, 0, 0, 0)
-
-
-cache_lock = threading.Lock()
-
 
 channel_dict = None
 channel_list = None
@@ -137,6 +137,933 @@ def is_installed(name):
                     return True
 
     return name.lower() in get_installed_packages()
+
+
+class ManagedResult:
+    def __init__(self, action):
+        self.action = action
+        self.items = []
+        self.result = True
+        self.to_path = None
+        self.msg = None
+        self.target = None
+        self.postinstall = None
+
+    def append(self, item):
+        self.items.append(item)
+
+    def fail(self, msg):
+        self.result = False
+        self.msg = msg
+        return self
+
+    def with_target(self, target):
+        self.target = target
+        return self
+
+    def with_msg(self, msg):
+        self.msg = msg
+        return self
+
+    def with_postinstall(self, postinstall):
+        self.postinstall = postinstall
+        return self
+
+
+class UnifiedManager:
+    def __init__(self):
+        self.cnr_inactive_nodes = {}       # node_id -> node_version -> fullpath
+        self.nightly_inactive_nodes = {}   # node_id -> fullpath
+        self.unknown_inactive_nodes = {}   # node_id -> repo url * fullpath
+        self.active_nodes = {}             # node_id -> node_version * fullpath
+        self.unknown_active_nodes = {}     # node_id -> repo url * fullpath
+        self.cnr_map = {}                  # node_id -> cnr info
+        self.repo_cnr_map = {}             # repo_url -> cnr info
+        self.custom_node_map_cache = {}  # (channel, mode) -> augmented custom node list json
+        self.processed_install = set()
+
+    def resolve_unspecified_version(self, node_name, guess_mode=None):
+        if guess_mode == 'active':
+            # priority:
+            # 1. CNR/nightly active nodes
+            # 2. unknown
+            # 3. Fail
+
+            if node_name in self.cnr_map:
+                version_spec = self.get_from_cnr_active_nodes(node_name)
+
+                if version_spec is None:
+                    if node_name in self.unknown_active_nodes:
+                        version_spec = "unknown"
+                    else:
+                        return None
+
+            elif node_name in self.unknown_active_nodes:
+                version_spec = "unknown"
+            else:
+                return None
+
+        elif guess_mode == 'inactive':
+            # priority:
+            # 1. CNR latest in inactive
+            # 2. nightly
+            # 3. unknown
+            # 4. Fail
+
+            if node_name in self.cnr_map:
+                latest = self.get_from_cnr_inactive_nodes(node_name)
+
+                if latest is not None:
+                    version_spec = latest[0]
+                else:
+                    if node_name in self.nightly_inactive_nodes:
+                        version_spec = "nightly"
+                    else:
+                        version_spec = "unknown"
+
+            elif node_name in self.repo_cnr_map:
+                version_spec = "unknown"
+            else:
+                return None
+
+        else:
+            # priority:
+            # 1. CNR latest in world
+            # 2. unknown
+
+            if node_name in self.cnr_map:
+                version_spec = self.cnr_map[node_name]['latest_version']['version']
+            else:
+                version_spec = "unknown"
+
+        return version_spec
+
+    def resolve_node_spec(self, node_name, guess_mode=None):
+        """
+        resolve to 'node_name, version_spec' from version string
+
+        version string:
+            node_name@latest
+            node_name@nightly
+            node_name@unknown
+            node_name@<version>
+            node_name
+
+        if guess_mode is 'active' or 'inactive'
+            return can be 'None' based on state check
+        otherwise
+            return 'unknown' version when failed to guess
+        """
+
+        spec = node_name.split('@')
+
+        if len(spec) == 2:
+            node_name = spec[0]
+            version_spec = spec[1]
+
+            if version_spec == 'latest':
+                if node_name not in self.cnr_map:
+                    print(f"ERROR: '{node_name}' is not a CNR node.")
+                    return None
+                else:
+                    version_spec = self.cnr_map[node_name]['latest_version']['version']
+
+        elif guess_mode in ['active', 'inactive']:
+            node_name = spec[0]
+            version_spec = self.resolve_unspecified_version(node_name, guess_mode=guess_mode)
+            if version_spec is None:
+                return None
+        else:
+            node_name = spec[0]
+            version_spec = self.resolve_unspecified_version(node_name)
+            if version_spec is None:
+                return None
+
+        return node_name, version_spec
+
+    def resolve_ver(self, fullpath):
+        """
+        resolve version of unclassified custom node based on remote url in .git/config
+        """
+        git_config_path = os.path.join(fullpath, '.git', 'config')
+
+        if not os.path.exists(git_config_path):
+            return "unknown"
+
+        config = configparser.ConfigParser()
+        config.read(git_config_path)
+
+        for k, v in config.items():
+            if k.startswith('remote ') and 'url' in v:
+                cnr = self.repo_cnr_map.get(v['url'])
+                if cnr:
+                    return "nightly"
+                else:
+                    return "unknown"
+
+    def resolve_id_from_repo(self, fullpath):
+        git_config_path = os.path.join(fullpath, '.git', 'config')
+
+        if not os.path.exists(git_config_path):
+            return None
+
+        config = configparser.ConfigParser()
+        config.read(git_config_path)
+
+        for k, v in config.items():
+            if k.startswith('remote ') and 'url' in v:
+                cnr = self.repo_cnr_map.get(v['url'])
+                if cnr:
+                    return "nightly", cnr['id'], v['url']
+                else:
+                    return "unknown", v['url'].split('/')[-1], v['url']
+
+    def resolve_unknown(self, node_id, fullpath):
+        res = self.resolve_id_from_repo(fullpath)
+
+        if res is None:
+            self.unknown_inactive_nodes[node_id] = '', fullpath
+            return
+
+        ver_spec, node_id, url = res
+
+        if ver_spec == 'nightly':
+            self.nightly_inactive_nodes[node_id] = fullpath
+        else:
+            self.unknown_inactive_nodes[node_id] = url, fullpath
+
+        git_config_path = os.path.join(fullpath, '.git', 'config')
+
+    def update_cache_at_path(self, fullpath, is_disabled):
+        name = os.path.basename(fullpath)
+
+        if name.endswith(".disabled"):
+            node_spec = name[:-9]
+            is_disabled = True
+        else:
+            node_spec = name
+
+        if '@' in node_spec:
+            node_spec = node_spec.split('@')
+            node_id = node_spec[0]
+            if node_id is None:
+                node_version = 'unknown'
+            else:
+                node_version = node_spec[1]
+        else:
+            res = self.resolve_id_from_repo(fullpath)
+            if res is None:
+                print(f"Custom node unresolved: {fullpath}")
+                return
+
+            node_version, node_id, _ = res
+
+        if not is_disabled:
+            # active nodes
+            if node_version == 'unknown':
+                self.unknown_active_nodes[node_id] = node_version, fullpath
+            else:
+                self.active_nodes[node_id] = node_version, fullpath
+        else:
+            if node_version == 'unknown':
+                self.resolve_unknown(node_id, fullpath)
+            elif node_version == 'nightly':
+                self.nightly_inactive_nodes[node_id] = fullpath
+            else:
+                self.add_to_cnr_inactive_nodes(node_id, node_version, fullpath)
+
+    def is_enabled(self, node_id, version_spec=None):
+        """
+        1. true if node_id@<specified_version> is enabled
+        2. true if node_id@<any> is enabled and version_spec==None
+        3. false otherwise
+
+        remark: latest version_spec is not allowed. Must be resolved before call.
+        """
+        if version_spec == "cnr":
+            return self.get_active_version(node_id) not in [None, 'unknown', 'nightly']
+        elif version_spec is not None and self.get_active_version(node_id) == version_spec:
+            return True
+        elif version_spec is None and node_id in self.active_nodes:
+            return True
+        return False
+
+    def is_disabled(self, node_id, version_spec=None):
+        """
+        1. node_id@unknown is disabled if version_spec is @unknown
+        2. node_id@nightly is disabled if version_spec is @nightly
+        4. node_id@<specified_version> is disabled if version_spec is not None
+        5. not exists (active node_id) if version_spec is None
+
+        remark: latest version_spec is not allowed. Must be resolved before call.
+        """
+        if version_spec == "unknown":
+            return node_id in self.unknown_inactive_nodes
+        elif version_spec == "nightly":
+            return node_id in self.nightly_inactive_nodes
+        elif version_spec == "cnr":
+            return self.cnr_inactive_nodes.get(node_id, None) not in [None, 'unknown', 'nightly']
+        elif version_spec is not None:
+            return self.cnr_inactive_nodes.get(node_id, None) == version_spec
+
+        return node_id not in self.active_nodes
+
+    def is_registered_in_cnr(self, node_id):
+        return node_id in self.cnr_map
+
+    def get_active_version(self, node_id):
+        res = self.active_nodes.get(node_id)
+        if res:
+            return res[0]
+        else:
+            return None
+
+    def add_to_cnr_inactive_nodes(self, node_id, ver, fullpath):
+        ver_map = self.cnr_inactive_nodes.get(node_id)
+        if ver_map is None:
+            ver_map = {}
+            self.cnr_inactive_nodes[node_id] = ver_map
+
+        ver_map[ver] = fullpath
+
+    def get_from_cnr_active_nodes(self, node_id):
+        ver_path = self.active_nodes.get(node_id)
+        if ver_path is None:
+            return None
+
+        return ver_path[0]
+
+    def get_from_cnr_inactive_nodes(self, node_id, ver=None):
+        ver_map = self.cnr_inactive_nodes.get(node_id)
+        if ver_map is None:
+            return None
+
+        if ver is not None:
+            return ver_map.get(ver)
+
+        latest = None
+        for k, v in ver_map:
+            if latest is None:
+                latest = self.safe_version(k), v
+                continue
+
+            cur_ver = self.safe_version(k)
+            if cur_ver > latest[0]:
+                latest = cur_ver, v
+
+        return latest
+
+    def reload(self):
+        self.custom_node_map_cache = {}
+        self.cnr_inactive_nodes = {}      # node_id -> node_version -> fullpath
+        self.nightly_inactive_nodes = {}  # node_id -> fullpath
+        self.unknown_inactive_nodes = {}  # node_id -> repo url * fullpath
+        self.unknown_active_nodes = {}    # node_id -> repo url * fullpath
+        self.active_nodes = {}            # node_id -> node_version * fullpath
+
+        # reload 'cnr_map' and 'repo_cnr_map'
+        cnrs = asyncio.run(cnr_utils.get_cnr_data())
+        for x in cnrs:
+            self.cnr_map[x['id']] = x
+
+            if 'repository' in x:
+                self.repo_cnr_map[x['repository']] = x
+
+        # reload node status info from custom_nodes/*
+        for x in os.listdir(custom_nodes_path):
+            fullpath = os.path.join(custom_nodes_path, x)
+            if os.path.isdir(fullpath):
+                if x not in ['__pycache__', '.disabled']:
+                    self.update_cache_at_path(fullpath, is_disabled=False)
+
+        # reload node status info from custom_nodes/.disabled/*
+        disabled_dir = os.path.join(custom_nodes_path, '.disabled')
+        if os.path.exists(disabled_dir):
+            for x in os.listdir(disabled_dir):
+                fullpath = os.path.join(disabled_dir, x)
+                if os.path.isdir(fullpath):
+                    self.update_cache_at_path(fullpath, is_disabled=True)
+
+    @staticmethod
+    async def load_nightly(channel, mode):
+        res = {}
+
+        tmp_dict = get_channel_dict()
+        if channel not in tmp_dict:
+            print(f"[bold red]ERROR: Invalid channel is specified `--channel {channel}`[/bold red]", file=sys.stderr)
+            return {}
+
+        if mode not in ['remote', 'local', 'cache']:
+            print(f"[bold red]ERROR: Invalid mode is specified `--mode {mode}`[/bold red]", file=sys.stderr)
+            return {}
+
+        channel_url = tmp_dict[channel]
+
+        json_obj = await get_data_by_mode(mode, 'custom-node-list.json', channel_url=channel_url)
+        for x in json_obj['custom_nodes']:
+            for y in x['files']:
+                if 'github.com' in y and not (y.endswith('.py') or y.endswith('.js')):
+                    repo_name = y.split('/')[-1]
+                    res[repo_name] = (x, False)
+
+            if 'id' in x:
+                if x['id'] not in res:
+                    res[x['id']] = (x, True)
+
+        return res
+
+    def get_custom_nodes(self, channel, mode):
+        cache = self.custom_node_map_cache.get((channel, mode))
+
+        if cache is not None:
+            return cache
+
+        nodes = asyncio.run(self.load_nightly(channel, mode))
+
+        res = {}
+        added_cnr = set()
+        for v in nodes.values():
+            v = v[0]
+            if len(v['files']) == 1:
+                cnr = self.repo_cnr_map.get(v['files'][0])
+                if cnr:
+                    if 'latest_version' not in cnr:
+                        v['cnr_latest'] = '0.0.0'
+                    else:
+                        v['cnr_latest'] = cnr['latest_version']['version']
+                    v['id'] = cnr['id']
+                    v['author'] = cnr['publisher']['name']
+                    v['title'] = cnr['name']
+                    v['description'] = cnr['description']
+                    v['health'] = '-'
+                    added_cnr.add(cnr['id'])
+                    node_id = v['id']
+                else:
+                    node_id = v['files'][0].split('/')[-1]
+                res[node_id] = v
+            elif len(v['files']) > 1:
+                for x in v['files']:
+                    res[x] = v  # single file style custom nodes' id should be full url
+
+        self.custom_node_map_cache[(channel, mode)] = res
+        return res
+
+    @staticmethod
+    def safe_version(ver_str):
+        try:
+            return version.parse(ver_str)
+        except:
+            return version.parse("0.0.0")
+
+    def execute_install_script(self, url, repo_path, lazy_mode=False, instant_execution=False):
+        install_script_path = os.path.join(repo_path, "install.py")
+        requirements_path = os.path.join(repo_path, "requirements.txt")
+
+        if lazy_mode:
+            install_cmd = ["#LAZY-INSTALL-SCRIPT", sys.executable]
+            try_install_script(url, repo_path, install_cmd)
+        else:
+            if os.path.exists(requirements_path):
+                print("Install: pip packages")
+                with open(requirements_path, "r") as requirements_file:
+                    for line in requirements_file:
+                        package_name = remap_pip_package(line.strip())
+                        if package_name and not package_name.startswith('#') and package_name not in self.processed_install:
+                            self.processed_install.add(package_name)
+                            install_cmd = [sys.executable, "-m", "pip", "install", package_name]
+                            if package_name.strip() != "" and not package_name.startswith('#'):
+                                try_install_script(url, repo_path, install_cmd, instant_execution=instant_execution)
+
+            if os.path.exists(install_script_path) and install_script_path not in self.processed_install:
+                self.processed_install.add(install_script_path)
+                print(f"Install: install script")
+                install_cmd = [sys.executable, "install.py"]
+                try_install_script(url, repo_path, install_cmd, instant_execution=instant_execution)
+
+        return True
+
+    def unified_fix(self, node_id, version_spec, instant_execution=False):
+        """
+        fix dependencies
+        """
+
+        result = ManagedResult('fix')
+        
+        info = self.active_nodes.get(node_id)
+        if info is None or not os.path.exists(info[1]):
+            return result.fail(f'not found: {node_id}@{version_spec}')
+
+        self.execute_install_script(node_id, info[1], instant_execution=instant_execution)
+
+        return result
+
+    def cnr_switch_version(self, node_id, version_spec=None, instant_execution=False, return_postinstall=False):
+        """
+        switch between cnr version
+        """
+
+        # 1. download
+        result = ManagedResult('switch-cnr')
+
+        node_info = cnr_utils.install_node(node_id, version_spec)
+        if node_info is None or not node_info.download_url:
+            return result.fail(f'not available node: {node_id}@{version_spec}')
+
+        version_spec = node_info['version']
+
+        archive_name = f"CNR_temp_{str(uuid)}.zip"  # should be unpredictable name - security precaution
+        download_path = os.path.join(custom_nodes_path, archive_name)
+        download_url(node_info.download_url, custom_nodes_path, archive_name)
+
+        # 2. extract files into <node_id>@<cur_ver>
+        install_path = self.active_nodes[node_id][1]
+        extracted = cnr_utils.extract_package_as_zip(download_path, install_path)
+        if extracted is None:
+            os.remove(download_path)
+            shutil.rmtree(install_path)
+            return result.fail(f'Empty archive file: {node_id}@{version_spec}')
+
+        # 3. calculate garbage files (.tracking - extracted)
+        tracking_info_file = os.path.join(install_path, '.tracking')
+        prev_files = set()
+        with open(tracking_info_file, 'r') as f:
+            for line in f:
+                prev_files.add(line)
+        garbage = prev_files.difference(extracted)
+        garbage = [os.path.join(custom_nodes_path, x) for x in garbage]
+
+        # 4-1. remove garbage files
+        for x in garbage:
+            if os.path.isfile(x):
+                os.remove(x)
+
+        # 4-2. remove garbage dir if empty
+        for x in garbage:
+            if os.path.isdir(x):
+                if not os.listdir(x):
+                    os.rmdir(x)
+
+        # 5. rename dir name <node_id>@<prev_ver> ==> <node_id>@<cur_ver>
+        new_install_path = os.path.join(custom_nodes_path, f'{node_id}@{version_spec}')
+        shutil.move(install_path, new_install_path)
+
+        # 6. create .tracking file
+        tracking_info_file = os.path.join(install_path, '.tracking')
+        with open(tracking_info_file, "w", encoding='utf-8') as file:
+            file.write('\n'.join(list(extracted)))
+
+        # 7. post install
+        result.target = version_spec
+
+        def postinstall():
+            return self.execute_install_script(f"{node_id}@{version_spec}", new_install_path, instant_execution=instant_execution)
+
+        if return_postinstall:
+            return result.with_postinstall(postinstall)
+        else:
+            if not postinstall():
+                return result.fail(f"Failed to execute install script: {node_id}@{version_spec}")
+
+        return result
+
+    def unified_enable(self, node_id, version_spec=None):
+        """
+        priority if version_spec == None
+        1. CNR latest in disk
+        2. nightly
+        3. unknown
+
+        remark: latest version_spec is not allowed. Must be resolved before call.
+        """
+
+        result = ManagedResult('enable')
+
+        if version_spec is None:
+            version_spec = self.resolve_unspecified_version(node_id, guess_mode='inactive')
+            if version is None:
+                return result.fail(f'Specified inactive node not exists: {node_id}')
+
+        if self.is_enabled(node_id, version_spec):
+            return ManagedResult('skip').with_msg('Already enabled')
+
+        if not self.is_disabled(node_id, version_spec):
+            return ManagedResult('skip').with_msg('Not installed')
+
+        from_path = None
+        to_path = None
+
+        if version_spec == 'unknown':
+            repo_and_path = self.unknown_inactive_nodes.get(node_id)
+            if repo_and_path is None:
+                return result.fail(f'Specified inactive node not exists: {node_id}@unknown')
+            from_path = repo_and_path[1]
+            to_path = os.path.join(custom_nodes_path, f"{node_id}@unknown")
+        elif version_spec == 'nightly':
+            from_path = self.nightly_inactive_nodes.get(node_id)
+            if from_path is None:
+                return result.fail(f'Specified inactive node not exists: {node_id}@nightly')
+            to_path = os.path.join(custom_nodes_path, f"{node_id}@nightly")
+        elif version_spec is not None:
+            cnr_info = self.cnr_inactive_nodes.get(node_id)
+
+            if cnr_info is None or len(cnr_info) == 0:
+                return result.fail(f'Specified inactive cnr node not exists: {node_id}')
+
+            if version_spec == "cnr":
+                version_spec = next(iter(cnr_info))
+
+            if version_spec not in cnr_info:
+                return result.fail(f'Specified inactive node not exists: {node_id}@{version_spec}')
+
+            from_path = cnr_info[version_spec]
+            to_path = os.path.join(custom_nodes_path, f"{node_id}@{version_spec}")
+
+        if from_path is None or not os.path.exists(from_path):
+            return result.fail(f'Specified inactive node path not exists: {from_path}')
+
+        # move from disk
+        shutil.move(from_path, to_path)
+
+        # update cache
+        if version_spec == 'unknown':
+            del self.unknown_inactive_nodes[node_id]
+            self.unknown_active_nodes[node_id] = to_path
+            return result
+        elif version_spec == 'nightly':
+            del self.nightly_inactive_nodes[node_id]
+        else:
+            del self.cnr_inactive_nodes[node_id][version_spec]
+
+        self.active_nodes[node_id] = version_spec, to_path
+        return result
+
+    def unified_disable(self, node_id, is_unknown):
+        result = ManagedResult('disable')
+
+        if is_unknown:
+            version_spec = 'unknown'
+        else:
+            version_spec = None
+
+        if not self.is_enabled(node_id, version_spec):
+            if not self.is_disabled(node_id, version_spec):
+                return ManagedResult('skip').with_msg('Not installed')
+            else:
+                return ManagedResult('skip').with_msg('Already disabled')
+
+        if is_unknown:
+            repo_and_path = self.unknown_active_nodes.get(node_id)
+            to_path = os.path.join(custom_nodes_path, '.disabled', f"{node_id}@unknown")
+
+            if repo_and_path is None or not os.path.exists(repo_and_path[1]):
+                return result.fail(f'Specified active node not exists: {node_id}@unknown')
+
+            shutil.move(repo_and_path[1], to_path)
+            result.append((repo_and_path[1], to_path))
+
+            self.unknown_inactive_nodes[node_id] = repo_and_path[0], to_path
+            del self.unknown_active_nodes[node_id]
+
+            return result
+
+        ver_and_path = self.active_nodes.get(node_id)
+
+        if ver_and_path is None or not os.path.exists(ver_and_path[1]):
+            return result.fail(f'Specified active node not exists: {node_id}')
+
+        to_path = os.path.join(custom_nodes_path, '.disabled', f"{node_id}@{ver_and_path[0]}")
+        shutil.move(ver_and_path[1], to_path)
+        result.append((ver_and_path[1], to_path))
+
+        if ver_and_path[0] == 'nightly':
+            self.nightly_inactive_nodes[node_id] = to_path
+        else:
+            self.add_to_cnr_inactive_nodes(node_id, ver_and_path[0], to_path)
+
+        del self.active_nodes[node_id]
+
+        return result
+
+    def unified_uninstall(self, node_id, is_unknown):
+        """
+        Remove whole installed custom nodes including inactive nodes
+        """
+        result = ManagedResult('uninstall')
+
+        if is_unknown:
+            # remove from actives
+            repo_and_path = self.unknown_active_nodes.get(node_id)
+
+            is_removed = False
+
+            if repo_and_path is not None and os.path.exists(repo_and_path[1]):
+                rmtree(repo_and_path[1])
+                result.append(repo_and_path[1])
+                del self.unknown_active_nodes[node_id]
+
+                is_removed = True
+
+            # remove from inactives
+            repo_and_path = self.unknown_inactive_nodes[node_id]
+
+            if repo_and_path is not None and os.path.exists(repo_and_path[1]):
+                rmtree(repo_and_path[1])
+                result.append(repo_and_path[1])
+                del self.unknown_inactive_nodes[node_id]
+
+                is_removed = True
+
+            if is_removed:
+                return result
+            else:
+                return ManagedResult('skip')
+
+        # remove from actives
+        ver_and_path = self.active_nodes.get(node_id)
+
+        if ver_and_path is None or not os.path.exists(ver_and_path[1]):
+            return ManagedResult('skip')
+
+        to_path = os.path.join(custom_nodes_path, '.disabled', f"{node_id}@{ver_and_path[0]}")
+        shutil.move(ver_and_path[1], to_path)
+
+        if ver_and_path[0] == 'nightly':
+            self.nightly_inactive_nodes[node_id] = to_path
+        else:
+            self.add_to_cnr_inactive_nodes(node_id, ver_and_path[0], to_path)
+
+        del self.active_nodes[node_id]
+
+        return result
+
+    def cnr_install(self, node_id, version_spec=None, instant_execution=False, return_postinstall=False):
+        result = ManagedResult('install-cnr')
+
+        node_info = cnr_utils.install_node(node_id, version_spec)
+        if node_info is None or not node_info.download_url:
+            return result.fail(f'not available node: {node_id}@{version_spec}')
+
+        archive_name = f"CNR_temp_{str(uuid.uuid4())}.zip"  # should be unpredictable name - security precaution
+        download_path = os.path.join(custom_nodes_path, archive_name)
+
+        # re-download. I cannot trust existing file.
+        if os.path.exists(download_path):
+            os.remove(download_path)
+
+        # install_path
+        install_path = os.path.join(custom_nodes_path, f'{node_id}@{version_spec}')
+        if os.path.exists(install_path):
+            return result.fail(f'Install path already exists: {install_path}')
+
+        download_url(node_info.download_url, custom_nodes_path, archive_name)
+        os.makedirs(install_path, exist_ok=True)
+        extracted = cnr_utils.extract_package_as_zip(download_path, install_path)
+        result.to_path = install_path
+
+        if extracted is None:
+            os.remove(download_path)
+            shutil.rmtree(install_path)
+            return result.fail(f'Empty archive file: {node_id}@{version_spec}')
+
+        # create .tracking file
+        tracking_info_file = os.path.join(install_path, '.tracking')
+        with open(tracking_info_file, "w", encoding='utf-8') as file:
+            file.write('\n'.join(extracted))
+
+        result.target = version_spec
+
+        def postinstall():
+            return self.execute_install_script(node_id, install_path, instant_execution=instant_execution)
+
+        if return_postinstall:
+            return result.with_postinstall(postinstall)
+        else:
+            if not postinstall():
+                return result.fail(f"Failed to execute install script: {node_id}@{version_spec}")
+
+        # remove garbage
+        os.remove(download_path)
+        return result
+
+    def repo_install(self, url, repo_path, instant_execution=False, return_postinstall=False):
+        result = ManagedResult('install-git')
+        result.append(url)
+
+        if not is_valid_url(url):
+            return result.fail(f"Invalid git url: {url}")
+
+        if url.endswith("/"):
+            url = url[:-1]
+        try:
+            print(f"Download: git clone '{url}'")
+
+            # Clone the repository from the remote URL
+            if not instant_execution and platform.system() == 'Windows':
+                res = manager_funcs.run_script([sys.executable, git_script_path, "--clone", custom_nodes_path, url, repo_path], cwd=custom_nodes_path)
+                if res != 0:
+                    return result.fail(f"Failed to clone repo: {url}")
+            else:
+                repo = git.Repo.clone_from(url, repo_path, recursive=True, progress=GitProgress())
+                repo.git.clear_cache()
+                repo.close()
+
+            def postinstall():
+                return self.execute_install_script(url, repo_path, instant_execution=instant_execution)
+
+            if return_postinstall:
+                return result.with_postinstall(postinstall)
+            else:
+                if not postinstall():
+                    return result.fail(f"Failed to execute install script: {url}")
+
+        except Exception as e:
+            return result.fail(f"Install(git-clone) error: {url} / {e}")
+
+        print("Installation was successful.")
+        return result
+
+    def repo_update(self, repo_path, instant_execution=False, return_postinstall=False):
+        result = ManagedResult('update-git')
+
+        if not os.path.exists(os.path.join(repo_path, '.git')):
+            return result.fail(f'Path not found: {repo_path}')
+
+        # version check
+        repo = git.Repo(repo_path)
+
+        if repo.head.is_detached:
+            switch_to_default_branch(repo)
+
+        current_branch = repo.active_branch
+        branch_name = current_branch.name
+
+        if current_branch.tracking_branch() is None:
+            print(f"[ComfyUI-Manager] There is no tracking branch ({current_branch})")
+            remote_name = 'origin'
+        else:
+            remote_name = current_branch.tracking_branch().remote_name
+        remote = repo.remote(name=remote_name)
+
+        try:
+            remote.fetch()
+        except Exception as e:
+            if 'detected dubious' in str(e):
+                print(f"[ComfyUI-Manager] Try fixing 'dubious repository' error on 'ComfyUI' repository")
+                safedir_path = comfy_path.replace('\\', '/')
+                subprocess.run(['git', 'config', '--global', '--add', 'safe.directory', safedir_path])
+                try:
+                    remote.fetch()
+                except Exception:
+                    print(f"\n[ComfyUI-Manager] Failed to fixing repository setup. Please execute this command on cmd: \n"
+                          f"-----------------------------------------------------------------------------------------\n"
+                          f'git config --global --add safe.directory "{safedir_path}"\n'
+                          f"-----------------------------------------------------------------------------------------\n")
+
+        commit_hash = repo.head.commit.hexsha
+        remote_commit_hash = repo.refs[f'{remote_name}/{branch_name}'].object.hexsha
+
+        if commit_hash != remote_commit_hash:
+            git_pull(repo_path)
+
+            if len(repo.remotes) > 0:
+                url = repo.remotes[0].url
+            else:
+                url = "unknown repo"
+
+            def postinstall():
+                return self.execute_install_script(url, repo_path, instant_execution=instant_execution)
+
+            if return_postinstall:
+                return result.with_postinstall(postinstall)
+            else:
+                if not postinstall():
+                    return result.fail(f"Failed to execute install script: {url}")
+
+            return result
+        else:
+            return ManagedResult('skip').with_msg('Up to date')
+
+    def unified_update(self, node_id, version_spec=None, instant_execution=False, return_postinstall=False):
+        if version_spec is None:
+            version_spec = self.resolve_unspecified_version(node_id, guess_mode='active')
+
+        if version_spec is None:
+            return ManagedResult('update').fail(f'Update not available: {node_id}@{version_spec}')
+
+        if version_spec == 'nightly':
+            return self.repo_update(self.active_nodes[node_id][1], instant_execution=instant_execution, return_postinstall=return_postinstall)
+        elif version_spec == 'unknown':
+            return self.repo_update(self.unknown_active_nodes[node_id][1], instant_execution=instant_execution, return_postinstall=return_postinstall)
+        else:
+            return self.cnr_switch_version(node_id, instant_execution=instant_execution, return_postinstall=return_postinstall)
+
+    def install_by_id(self, node_id, version_spec=None, channel=None, mode=None, instant_execution=False, return_postinstall=False):
+        """
+        priority if version_spec == None
+        1. CNR latest
+        2. unknown
+
+        remark: latest version_spec is not allowed. Must be resolved before call.
+        """
+
+        repo_url = None
+        if version_spec is None:
+            version_spec = self.resolve_unspecified_version(node_id)
+
+        if version_spec == 'unknown' or version_spec == 'nightly':
+            the_node = self.get_custom_nodes(channel, mode).get(node_id)
+            if the_node is not None:
+                repo_url = the_node['files'][0]
+            else:
+                result = ManagedResult('install')
+                return result.fail(f"Node '{node_id}@{version_spec}' not found in [{channel}, {mode}]")
+
+        if self.is_enabled(node_id, version_spec):
+            return ManagedResult('skip')
+
+        elif self.is_disabled(node_id, version_spec):
+            return self.unified_enable(node_id, version_spec)
+
+        elif version_spec == 'unknown' or version_spec == 'nightly':
+            if version_spec == 'nightly':
+                # disable cnr nodes
+                if self.is_enabled(node_id, 'cnr'):
+                    self.unified_disable(node_id, False)
+
+            to_path = os.path.abspath(os.path.join(custom_nodes_path, f'{node_id}@{version_spec}'))
+            res = self.repo_install(repo_url, to_path, instant_execution=instant_execution, return_postinstall=return_postinstall)
+            if res.result:
+                if version_spec == 'unknown':
+                    self.unknown_active_nodes[node_id] = to_path
+                elif version_spec == 'nightly':
+                    self.active_nodes[node_id] = 'nightly', to_path
+
+            return res.with_target(version_spec)
+
+        if self.is_enabled(node_id, 'nightly'):
+            # disable nightly nodes
+            self.unified_disable(node_id, 'nightly')  # NOTE: don't return from here
+
+        if self.is_disabled(node_id, version_spec):
+            # enable and return if specified version is disabled
+            return self.unified_enable(node_id, version_spec)
+
+        if self.is_disabled(node_id, "cnr"):
+            # enable and switch version if cnr is disabled (not specified version)
+            self.unified_enable(node_id, "cnr")
+            return self.cnr_switch_version(node_id, version_spec)
+
+        if self.is_enabled(node_id, "cnr"):
+            return self.cnr_switch_version(node_id, version_spec)
+
+        res = self.cnr_install(node_id, version_spec, instant_execution=instant_execution, return_postinstall=return_postinstall)
+        if res.result:
+            self.active_nodes[node_id] = version_spec, res.to_path
+
+        return res
+
+
+unified_manager = UnifiedManager()
 
 
 def get_channel_dict():
@@ -574,25 +1501,6 @@ def git_pull(path):
     return True
 
 
-async def get_data(uri, silent=False):
-    if not silent:
-        print(f"FETCH DATA from: {uri}", end="")
-
-    if uri.startswith("http"):
-        async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(verify_ssl=False)) as session:
-            async with session.get(uri) as resp:
-                json_text = await resp.text()
-    else:
-        with cache_lock:
-            with open(uri, "r", encoding="utf-8") as f:
-                json_text = f.read()
-
-    json_obj = json.loads(json_text)
-    if not silent:
-        print(f" [DONE]")
-    return json_obj
-
-
 def simple_hash(input_string):
     hash_value = 0
     for char in input_string:
@@ -775,7 +1683,7 @@ def gitclone_set_active(files, is_disable):
                 current_path = dir_path + ".disabled"
                 new_path = dir_path
 
-            os.rename(current_path, new_path)
+            shutil.move(current_path, new_path)
 
             if is_disable:
                 if os.path.exists(os.path.join(new_path, "disable.py")):

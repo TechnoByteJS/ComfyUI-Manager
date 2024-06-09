@@ -1,3 +1,11 @@
+import aiohttp
+import json
+import threading
+
+
+cache_lock = threading.Lock()
+
+
 try:
     from distutils.version import StrictVersion
 except:
@@ -61,3 +69,21 @@ except:
         def __ne__(self, other):
             return not self == other
 
+
+async def get_data(uri, silent=False):
+    if not silent:
+        print(f"FETCH DATA from: {uri}", end="")
+
+    if uri.startswith("http"):
+        async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(verify_ssl=False)) as session:
+            async with session.get(uri) as resp:
+                json_text = await resp.text()
+    else:
+        with cache_lock:
+            with open(uri, "r", encoding="utf-8") as f:
+                json_text = f.read()
+
+    json_obj = json.loads(json_text)
+    if not silent:
+        print(f" [DONE]")
+    return json_obj
